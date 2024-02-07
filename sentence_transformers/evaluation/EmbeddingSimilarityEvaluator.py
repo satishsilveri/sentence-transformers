@@ -7,6 +7,7 @@ from scipy.stats import pearsonr, spearmanr
 import numpy as np
 from typing import List
 from ..readers import InputExample
+import torch
 
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,28 @@ class EmbeddingSimilarityEvaluator(SentenceEvaluator):
             scores.append(example.label)
         return cls(sentences1, sentences2, scores, **kwargs)
 
-    def __call__(self, model, output_path: str = None, epoch: int = -1, steps: int = -1) -> float:
+    @classmethod
+    def mean_pooling(self, model_output, attention_mask):
+        token_embeddings = model_output[0] #First element of model_output contains all token embeddings
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return (torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)).cpu().detach().numpy()
+
+    @classmethod
+    def generate_embeddings(self, tokenizer, model, sentence):
+
+        # Tokenize sentences
+        encoded_input = tokenizer(sentence, padding=True, truncation=True, return_tensors='pt')
+        
+        # Compute token embeddings
+        with torch.no_grad():
+            model_output = model(**encoded_input)
+        
+        # Perform pooling. In this case, mean pooling.
+        sentence_embedding = self.mean_pooling(model_output, encoded_input['attention_mask'])
+
+        return sentence_embedding
+
+    def __call__(self, model, tokenizer = None, optimized_model: bool = False, output_path: str = None, epoch: int = -1, steps: int = -1) -> float:
         if epoch != -1:
             if steps == -1:
                 out_txt = " after epoch {}:".format(epoch)
@@ -98,18 +120,29 @@ class EmbeddingSimilarityEvaluator(SentenceEvaluator):
 
         logger.info("EmbeddingSimilarityEvaluator: Evaluating the model on " + self.name + " dataset" + out_txt)
 
-        embeddings1 = model.encode(
-            self.sentences1,
-            batch_size=self.batch_size,
-            show_progress_bar=self.show_progress_bar,
-            convert_to_numpy=True,
-        )
-        embeddings2 = model.encode(
-            self.sentences2,
-            batch_size=self.batch_size,
-            show_progress_bar=self.show_progress_bar,
-            convert_to_numpy=True,
-        )
+        embeddings1 = None
+        embeddings2 = None
+
+        if optimized_model:
+
+            embeddings1 = self.generate_embeddings(tokenizer = tokenizer, model = model, sentence = self.sentences1)
+            embeddings2 = self.generate_embeddings(tokenizer = tokenizer, model = model, sentence = self.sentences2)
+
+        else:
+
+            embeddings1 = model.encode(
+                self.sentences1,
+                batch_size=self.batch_size,
+                show_progress_bar=self.show_progress_bar,
+                convert_to_numpy=True,
+            )
+            embeddings2 = model.encode(
+                self.sentences2,
+                batch_size=self.batch_size,
+                show_progress_bar=self.show_progress_bar,
+                convert_to_numpy=True,
+            )
+        
         labels = self.scores
 
         cosine_scores = 1 - (paired_cosine_distances(embeddings1, embeddings2))
